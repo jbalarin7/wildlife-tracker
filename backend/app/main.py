@@ -1,10 +1,17 @@
+import json
+import sys
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from .database import get_connection, init_db
 from .security import (
@@ -17,7 +24,27 @@ from .security import (
     verify_password,
 )
 
-app = FastAPI(title="Wildlife Tracker API", version="0.2.0")
+limiter = Limiter(key_func=get_remote_address)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="Wildlife Tracker API", version="0.3.0", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -25,10 +52,9 @@ ALLOWED_IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024
 
 
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
-
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
 
 class RegisterRequest(BaseModel):
     email: EmailStr
@@ -49,12 +75,21 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+
 def get_current_user_id(authorization: Optional[str] = Header(default=None)) -> int:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     user_id = parse_auth_token(authorization.replace("Bearer ", "", 1))
     if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
     return user_id
 
 
@@ -63,8 +98,25 @@ def _validate_password(password: str) -> None:
         raise HTTPException(status_code=400, detail="Password must have at least 8 characters")
 
 
+def _parse_images(raw: object) -> list[str]:
+    """Deserialize the JSON string returned by SQLite json_group_array."""
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw) if raw else []
+        except json.JSONDecodeError:
+            return []
+    if isinstance(raw, list):
+        return raw
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------------------
+
 @app.post("/auth/register")
-def register(payload: RegisterRequest):
+@limiter.limit("5/minute")
+def register(request: Request, payload: RegisterRequest):
     _validate_password(payload.password)
     conn = get_connection()
     try:
@@ -119,7 +171,8 @@ def verify_email(token: str):
 
 
 @app.post("/auth/login")
-def login(payload: LoginRequest):
+@limiter.limit("10/minute")
+def login(request: Request, payload: LoginRequest):
     conn = get_connection()
     user = conn.execute(
         "SELECT id, password_hash, is_verified FROM users WHERE email = ?",
@@ -136,7 +189,8 @@ def login(payload: LoginRequest):
 
 
 @app.post("/auth/forgot-password")
-def forgot_password(payload: ForgotPasswordRequest):
+@limiter.limit("3/minute")
+def forgot_password(request: Request, payload: ForgotPasswordRequest):
     conn = get_connection()
     user = conn.execute("SELECT id FROM users WHERE email = ?", (payload.email.lower(),)).fetchone()
     if not user:
@@ -182,6 +236,37 @@ def reset_password(payload: ResetPasswordRequest):
     return {"message": "Password updated"}
 
 
+@app.get("/auth/me")
+def me(user_id: int = Depends(get_current_user_id)):
+    conn = get_connection()
+    user = conn.execute(
+        "SELECT id, email, created_at FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return dict(user)
+
+
+@app.post("/auth/change-password")
+def change_password(payload: ChangePasswordRequest, user_id: int = Depends(get_current_user_id)):
+    """Change password for the currently authenticated user."""
+    _validate_password(payload.new_password)
+    conn = get_connection()
+    user = conn.execute("SELECT id, password_hash FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user or not verify_password(payload.current_password, user["password_hash"]):
+        conn.close()
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    conn.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(payload.new_password), user_id))
+    conn.commit()
+    conn.close()
+    return {"message": "Password changed"}
+
+
+# ---------------------------------------------------------------------------
+# Occurrence endpoints
+# ---------------------------------------------------------------------------
+
 @app.post("/occurrences")
 async def create_occurrence(
     category: str = Form(...),
@@ -202,8 +287,8 @@ async def create_occurrence(
         """
         INSERT INTO occurrences (
             user_id, category, common_name, scientific_name, observed_at,
-            latitude, longitude, description, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            latitude, longitude, description, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'approved', ?)
         """,
         (
             user_id,
@@ -253,29 +338,80 @@ def list_occurrences(
     offset: int = Query(default=0, ge=0),
 ):
     conn = get_connection()
-    base = """
+    where = "WHERE o.status = 'approved'"
+    params: list[object] = []
+    if category:
+        where += " AND o.category = ?"
+        params.append(category)
+    if q:
+        where += " AND (o.common_name LIKE ? OR IFNULL(o.scientific_name,'') LIKE ?)"
+        params.extend([f"%{q}%", f"%{q}%"])
+
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM occurrences o {where}", params
+    ).fetchone()[0]
+
+    base = f"""
     SELECT o.*, u.email,
       (SELECT json_group_array(file_path) FROM occurrence_images i WHERE i.occurrence_id = o.id) AS images
     FROM occurrences o
     JOIN users u ON u.id = o.user_id
-    WHERE 1=1
+    {where}
     """
-    params: list[object] = []
-    if category:
-        base += " AND o.category = ?"
-        params.append(category)
-    if q:
-        base += " AND (o.common_name LIKE ? OR IFNULL(o.scientific_name,'') LIKE ?)"
-        params.extend([f"%{q}%", f"%{q}%"])
-
-    params.extend([limit, offset])
-    rows = [
-        dict(r)
-        for r in conn.execute(base + " ORDER BY o.created_at DESC LIMIT ? OFFSET ?", params).fetchall()
-    ]
+    rows = conn.execute(base + " ORDER BY o.created_at DESC LIMIT ? OFFSET ?", [*params, limit, offset]).fetchall()
+    items = []
+    for r in rows:
+        item = dict(r)
+        item["images"] = _parse_images(item.get("images"))
+        items.append(item)
     conn.close()
-    return rows
+    return {"total": total, "items": items}
 
+
+@app.get("/occurrences/{occurrence_id}")
+def get_occurrence(occurrence_id: int):
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT o.*, u.email,
+          (SELECT json_group_array(file_path)
+           FROM occurrence_images i WHERE i.occurrence_id = o.id) AS images
+        FROM occurrences o
+        JOIN users u ON u.id = o.user_id
+        WHERE o.id = ?
+        """,
+        (occurrence_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Occurrence not found")
+    result = dict(row)
+    result["images"] = _parse_images(result.get("images"))
+    return result
+
+
+@app.delete("/occurrences/{occurrence_id}")
+def delete_occurrence(occurrence_id: int, user_id: int = Depends(get_current_user_id)):
+    """Delete an occurrence. Only the owner can delete their own sighting."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT user_id FROM occurrences WHERE id = ?", (occurrence_id,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Occurrence not found")
+    if row["user_id"] != user_id:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Not authorized to delete this occurrence")
+    conn.execute("DELETE FROM occurrences WHERE id = ?", (occurrence_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "Occurrence deleted"}
+
+
+# ---------------------------------------------------------------------------
+# Map endpoint
+# ---------------------------------------------------------------------------
 
 @app.get("/map/geojson")
 def map_geojson(
@@ -285,7 +421,7 @@ def map_geojson(
     max_lng: Optional[float] = None,
 ):
     conn = get_connection()
-    query = "SELECT id, category, common_name, latitude, longitude, observed_at FROM occurrences WHERE 1=1"
+    query = "SELECT id, category, common_name, latitude, longitude, observed_at FROM occurrences WHERE status = 'approved'"
     params: list[object] = []
     if None not in (min_lat, max_lat, min_lng, max_lng):
         query += " AND latitude BETWEEN ? AND ? AND longitude BETWEEN ? AND ?"

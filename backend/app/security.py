@@ -2,9 +2,23 @@ import hashlib
 import hmac
 import os
 import secrets
+import sys
+import warnings
 from datetime import datetime, timedelta, timezone
 
+from jose import JWTError, jwt
+
 SECRET_KEY = os.getenv("WILDLIFE_SECRET_KEY", "dev-secret-change-me")
+ALGORITHM = "HS256"
+TOKEN_EXPIRE_DAYS = 7
+
+if SECRET_KEY == "dev-secret-change-me":
+    warnings.warn(
+        "\n[wildlife-tracker] WARNING: WILDLIFE_SECRET_KEY is using the insecure default value.\n"
+        "  Set the WILDLIFE_SECRET_KEY environment variable before deploying to production.\n",
+        RuntimeWarning,
+        stacklevel=1,
+    )
 
 
 def now_iso() -> str:
@@ -28,22 +42,22 @@ def generate_token() -> str:
 
 
 def auth_token_for_user(user_id: int) -> str:
-    payload = f"{user_id}:{int(datetime.now(tz=timezone.utc).timestamp())}"
-    sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return f"{payload}:{sig}"
+    """Create a signed JWT with a 7-day expiry."""
+    now = datetime.now(tz=timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(days=TOKEN_EXPIRE_DAYS)).timestamp()),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def parse_auth_token(token: str) -> int | None:
+    """Decode and validate a JWT; return the user_id or None on failure."""
     try:
-        uid, ts, sig = token.split(":", 2)
-        payload = f"{uid}:{ts}"
-        expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
-            return None
-        if datetime.now(tz=timezone.utc).timestamp() - int(ts) > 60 * 60 * 24 * 7:
-            return None
-        return int(uid)
-    except Exception:
+        data = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return int(data["sub"])
+    except (JWTError, KeyError, ValueError):
         return None
 
 

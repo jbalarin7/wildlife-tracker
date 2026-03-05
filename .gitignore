@@ -7,3 +7,4 @@ venv/
 backend/.venv/
 backend/uploads/
 backend/wildlife.db
+node_modules/

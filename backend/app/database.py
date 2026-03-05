@@ -52,6 +52,7 @@ def init_db() -> None:
             latitude REAL NOT NULL,
             longitude REAL NOT NULL,
             description TEXT,
+            status TEXT NOT NULL DEFAULT 'approved',
             created_at TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
         );
@@ -66,4 +67,12 @@ def init_db() -> None:
         """
     )
     conn.commit()
+
+    # Idempotent migration: add status column to existing databases
+    try:
+        conn.execute("ALTER TABLE occurrences ADD COLUMN status TEXT NOT NULL DEFAULT 'approved'")
+        conn.commit()
+    except Exception:
+        pass  # Column already exists
+
     conn.close()
